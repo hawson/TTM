@@ -1,0 +1,684 @@
+#!/usr/bin/perl -w
+#
+# ttm -- tiny task manager
+#
+# Copyright (c) 1999 Adam Spiers <adam@spiers.net>. All rights
+# reserved. This program is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#
+# $Id: ttm,v 1.32 2003/01/04 23:42:57 adams Exp $
+#
+
+require 5.004;
+use strict;
+
+my $VERSION = '0.64';
+
+use Getopt::Std;
+use Text::Abbrev;
+use Fcntl qw{:DEFAULT :flock};
+use MLDBM qw{GDBM_File Storable};
+
+# Where shall we store the task database?
+my $ttmdir   = "$ENV{HOME}/.ttm";
+# What shall we call the GDBM file in this directory?
+my $dbm_file = "tasks.gdbm";
+
+my @priorities = (
+                  [ 'emergency'  , 'do it NOW!'                        ],
+                  [ 'critical'   , 'action needed TODAY'               ],
+                  [ 'urgent'     , 'action needed today or tomorrow'   ],
+                  [ 'important'  , 'action needed within a few days'   ],
+                  [ 'sooner'     , 'action needed within a week'       ],
+                  [ 'later'      , 'action needed within a few weeks'  ],
+                  [ 'sometime'   , 'action needed within a few months' ],
+                  [ 'eventually' , 'whenever, dude'                    ],
+                  [ 'CFT'        , 'dogwash priority'                  ],
+                 );
+
+# What priority do tasks get sorted with if no priority specified?
+my $default_priority = 4;
+
+# Default lowest priority (threshold) shown
+my $default_threshold = 3;
+
+# Maximum task id
+my $max_task_id = 999;
+
+# Which editor shall we use?
+my $editor  = $ENV{VISUAL} || $ENV{EDITOR} || 'emacs -nw';
+
+# Calculate terminal width.
+my $columns = $ENV{COLUMNS} || 80;
+
+#----------------------------------------------------------------------------#
+# You shouldn't have to hack around with anything below here, unless you
+# really want to (in which case, let me know what you do).
+#----------------------------------------------------------------------------#
+
+my %opts = ();
+my %tasks = ();
+
+if (@ARGV and $ARGV[0] =~ /^-[^dh]/) {
+  unshift @ARGV, 'list';
+}
+
+getopts('d:h', \%opts);
+
+if ($opts{h}) {
+  usage();
+}
+
+$opts{d} and $ttmdir = $opts{d};
+check_tmdir();
+read_in_tasks();
+
+my %actions = ();
+abbrev \%actions, qw/list grep
+                     add new
+                     edit
+                     modify
+                     resolve complete finish
+                     kill delete remove
+                     categories
+                     priorities
+                    /;
+
+# import/export can't be abbreviated
+$actions{$_} = $_ for qw/import export/;
+
+# Synonyms
+foreach (keys %actions) {
+  $actions{$_} =~ s/remove|delete/kill/i;
+  $actions{$_} =~ s/new/add/i;
+  $actions{$_} =~ s/finish|complete/resolve/i;
+}  
+
+my $action;
+
+if (@ARGV == 0) {
+  $action = 'list';
+}
+else {
+  if ($ARGV[0] =~ /^[a-z]+$/) {
+    if (exists $actions{$ARGV[0]}) {
+      $action = $actions{+shift};
+    }
+    else {
+      $action = 'list';
+    }
+  }
+  else {
+    $action = 'list';
+  }
+}
+
+# Another synonyms
+if ($action eq 'grep') {
+  $action = 'list';
+  unshift @ARGV, '-g', pop(@ARGV);
+}
+
+if ($action eq 'list') {
+  if (@ARGV == 1 and $ARGV[0] =~ /^\d+$/) {
+    display_task($ARGV[0]);
+  }
+  else {
+    my %list_opts = ();
+    getopts('Aag:s:t:v', \%list_opts);
+    display_task_list(\%list_opts, @ARGV);
+  }
+}
+elsif ($action eq 'add') {
+  usage() if @ARGV;
+  add_task();
+}
+elsif ($action eq 'edit') {
+  usage() unless @ARGV == 1;
+  edit_task($ARGV[0]);
+}
+elsif ($action eq 'modify') {
+  usage() unless @ARGV == 1 or @ARGV == 2;
+  modify_task_status(@ARGV);
+}
+elsif ($action eq 'resolve') {
+  usage() unless @ARGV == 1;
+  resolve_task($ARGV[0]);
+}
+elsif ($action eq 'kill') {
+  usage() unless @ARGV == 1;
+  kill_task($ARGV[0]);
+}
+elsif ($action eq 'categories') {
+  list_categories();
+}
+elsif ($action eq 'priorities') {
+  list_priorities();
+}
+elsif ($action eq 'import') {
+  import_from_text_files();
+}
+elsif ($action eq 'export') {
+  export_to_text_files();
+}
+else {
+  bug();
+}
+
+untie %tasks;
+release_lock();
+
+exit 0;
+
+
+#----------------------------------------------------------------------------#
+# subroutines follow ...
+#----------------------------------------------------------------------------#
+
+sub usage {
+  print <<USAGE;
+ttm $VERSION, (c) 1999 Adam Spiers <adam\@spiers.net>
+
+Usage: ttm [ -d <dir> ] <action> <params>
+Actions (except import and export) may be abbreviated unambiguously, and are:
+   list [-a|-A] [-v] [-s <status regexp>] [-t <threshold>] [<categories>]
+                  -- list unblocked, unresolved, neglected tasks (by category)
+                      `-A' shows all tasks regardless of status/priority
+                      `-a' shows all unresolved tasks regardless of priority
+                      `-s' shows tasks matching the specified status regexp
+                      `-t' specifies a priority threshold (default 5)
+                      `-v' inverts the sense of category matching
+   list/edit <id> -- display/edit a single task
+   add            -- add a new task
+   modify <id> <new status> }_ change a task's status 
+   resolve <id>             }  (new status can be abbreviated)
+   kill <id>      -- kill a task (normally you should use resolve instead)
+   grep <regexp>  -- grep all tasks for regexp (actually an alias for
+                     `list -a -g <regexp>', hence all list options work too)
+   categories     -- list all existing categories
+   priorities     -- list all priorities
+   import/export  -- import/export from/to text files to/from GDBM
+`list' may be omitted altogether, unless `-d' is being used.
+USAGE
+
+  exit 0;
+}
+
+sub bug {
+  die <<'EOF';
+Congratulations, you have found a bug in ttm.  
+
+/Please/ e-mail Adam Spiers <adam@spiers.net> explaining exactly how
+you achieved this, so that he can fix it.
+EOF
+
+  exit 1;
+}
+
+#----------------------------------------------------------------------------#
+# file access
+#----------------------------------------------------------------------------#
+
+sub read_in_tasks {
+  set_lock();
+
+  tie %tasks, 'MLDBM', "$ttmdir/$dbm_file", O_CREAT | O_RDWR, 0640
+    or die "Couldn't open $ttmdir/$dbm_file: $!\n";
+}
+
+sub read_in_task_from_text_file {
+  my ($id) = @_;
+
+  open(TASK, "$ttmdir/$id") or die "Couldn't open $ttmdir/$id: $!\n";
+
+  my %task = ();
+
+  # Read in headers
+  while (<TASK>) {
+    chomp;
+
+    if (/^(\w+?): (.*)$/) {
+      die "`body' not allowed as header\n" if $1 eq 'body';
+      $task{$1} = $2;
+      next;
+    }
+
+    last if /^-/;
+  }
+
+  # Read in body
+  {
+    local $/ = undef;
+    $task{body} = <TASK> || '';
+  }
+
+  close(TASK);
+
+  $tasks{$id} = \%task;
+}
+
+sub write_task_to_text_file {
+  my ($id) = @_;
+
+  open(TASK, ">$ttmdir/$id")
+    or die "Couldn't open $ttmdir/$id for writing: $!\n";
+
+  my %task = %{$tasks{$id}};
+
+  my $format = "%s: %s\n";
+
+  foreach my $header (core_headers(),
+                      grep { is_user_header($_) } keys %task)
+  {
+    my $value = $task{$header} || '';
+    printf TASK $format, $header, $value;
+  }
+
+  print TASK '-' x ($columns - 1), "\n";
+
+  my $body = $task{body} || '';
+  $body =~ s/\n*\Z/\n/s;
+  print TASK $body;
+  close(TASK);
+}  
+
+sub next_free_id {
+  my $next;
+  foreach my $id (keys %tasks) {
+    $next = $id if $next < $id;
+  }
+  $next ||= 0;
+
+  $next++;
+
+  if ($next >= $max_task_id) {
+    $next = 1;
+    $next++ while exists $tasks{$next};
+  }
+
+  return $next;
+}
+
+sub set_lock {
+  my ($type) = @_;
+
+  $type ||= 'exclusive';
+
+  my $lock = "$ttmdir/.lock";
+
+  if (! -e $lock) {
+    open(LOCK, ">$lock")
+      or die "Couldn't open $lock for writing: $!\n";
+    close(LOCK) or die "Couldn't close $lock: $!\n";
+  }
+
+  open(LOCK, $lock) or die "Couldn't open $lock: $!\n";
+  flock(LOCK, (($type eq 'exclusive') ? LOCK_EX : LOCK_SH) | LOCK_NB)
+    or die <<EOF;
+Another ttm process seems to be changing the task database.
+Please terminate it and try again.
+EOF
+}
+
+sub release_lock {
+  close(LOCK);
+}
+
+sub check_tmdir {
+  return if -d $ttmdir;
+
+  if (-e $ttmdir) {
+    die "$ttmdir exists but is not a directory.\n";
+  }
+  else {
+    print "$ttmdir does not exist.  Shall I create it for you? ";
+    my $reply = <STDIN>;
+    if ($reply =~ /y/i) {
+      mkdir $ttmdir, 0777   # let's hope the umask is right!
+        or die "Couldn't create $ttmdir: $!\n";
+    }
+    else {
+      die "Cannot proceed without task database directory.\n";
+    }
+  }
+}
+
+#----------------------------------------------------------------------------#
+# actions
+#----------------------------------------------------------------------------#
+
+sub display_task {
+  my ($id) = @_;
+
+  check_task_exists($id);
+
+  my $format = "%12s: %s\n";
+
+  printf $format, 'summary', summary($id);
+  printf $format, 'priority',
+                  priority($id) . " (" . priority($id, 'long') . ")";
+
+  printf $format, 'categories', categories($id);
+  printf $format, 'date due',   date_due($id);
+  printf $format, 'status',     status($id);
+
+  my %task = %{$tasks{$id}};
+  foreach my $header (grep { is_user_header($_) } keys %task) {
+    my $value = $task{$header} || '';
+    printf $format, $header, $value;
+  }
+
+  print '-' x ($columns - 1), "\n";
+
+  my $body = $task{body} || '';
+  $body =~ s/\n*$/\n/s;
+  print $body;
+}
+
+sub display_task_list {
+  my ($opts, @categories) = @_;
+
+  my %grep = ();
+  if ($opts->{g}) {
+    my $re = ($opts->{g} =~ /[A-Z]/) ? qr/$opts->{g}/ : qr/$opts->{g}/i;
+
+   TASK:
+    foreach my $id (keys %tasks) {
+      my %task = %{$tasks{$id}};
+      foreach my $key (keys %task) {
+        if ($task{$key} =~ /$re/) {
+          $grep{$id}++;
+          next TASK;
+        }
+      }
+    }
+  }
+
+  my ($exclude_status_re, $include_status_re);
+
+  $exclude_status_re
+    = qr/(done|resolved|completed?|finish(ed)?|blocked|scheduled)/i;
+
+  if ($opts->{a}) {
+    $exclude_status_re = qr/(done|resolved|completed?|finish(ed)?)/i
+  }
+  else {
+    if ($opts->{s}) {
+      undef $exclude_status_re;
+      $include_status_re = qr/$opts->{s}/i;
+    } 
+  }
+
+  $opts->{t} ||= $default_threshold;
+
+  my $hformat = "%3s %10.10s  %-9.9s %-53s\n";
+  my  $format = "%3d %10.10s  %-9.9s %-53s\n";
+
+  my $out = '';
+
+  $out .= sprintf $hformat, qw/id priority status summary/;
+  $out .= sprintf '-' x ($columns - 1) . "\n";
+
+  my $matches = 0;
+  foreach my $id (sort by_priority keys %tasks) {
+    if (@categories) {
+      next unless (is_in_categories($id, @categories) xor $opts->{v});
+    }
+
+    if (! $opts->{A}) {
+      next if $exclude_status_re and status($id) =~ $exclude_status_re;
+      next if $include_status_re and status($id) !~ $include_status_re;
+    }
+
+    if (! $opts->{A} && ! $opts->{a} && ! $opts->{g} && ! @categories) {
+      next if dpriority($id) > $opts->{t};
+    }
+
+    if ($opts->{g}) {
+      next unless exists $grep{$id};
+    }
+
+    $out .= sprintf $format, $id, priority($id), status($id), summary($id);
+    $matches++;
+  }
+
+  if ($matches) {
+    print $out;
+  }
+  else {
+    print "no tasks found\n";
+  }
+}
+
+sub add_task {
+  my $id = next_free_id();
+
+  my @old_cats = all_categories();
+
+  my %task = (
+              summary    => '',
+              priority   => '',
+              categories => '',
+              body       => '',
+             );
+  $tasks{$id} = \%task;
+  write_task_to_text_file($id);
+  
+  system "$editor $ttmdir/$id";
+  read_in_task_from_text_file($id);
+  unlink "$ttmdir/$id";
+
+  my @new_cats = all_categories();
+
+  print "Added new task `" . summary($id) . "' (id $id)\n";
+  show_category_changes(\@old_cats, \@new_cats);
+}
+
+sub edit_task {
+  my ($id) = @_;
+
+  # We trust the editor of choice take care of locking
+  check_task_exists($id);
+  my @old_cats = all_categories();
+
+  write_task_to_text_file($id);
+  system "$editor $ttmdir/$id";
+  read_in_task_from_text_file($id);
+  unlink "$ttmdir/$id";
+
+  my @new_cats = all_categories();
+  show_category_changes(\@old_cats, \@new_cats);
+}
+
+sub resolve_task {
+  my ($id) = @_;
+  check_task_exists($id);
+  my %task = %{$tasks{$id}};
+  $task{status} = 'resolved';
+  $tasks{$id} = \%task;
+  print "Resolved task `" . summary($id) . "' (id $id).\nGood going!\n";
+}
+
+sub modify_task_status {
+  my ($id, $new_status) = @_;
+  $new_status ||= '';
+
+  check_task_exists($id);
+
+  my %status = ();
+  abbrev(\%status, qw/resolved complete scheduled blocked attended/);
+  $new_status = $status{$new_status} if exists $status{$new_status};
+
+  my %task = %{$tasks{$id}};
+  $task{status} = $new_status;
+  $tasks{$id} = \%task;
+    
+  if ($new_status) {
+    print "Changed status of task `" . summary($id) . "' (id $id) to `$new_status'.\n";
+  }
+  else {
+    print "Removed status from task `" . summary($id) . "' (id $id).\n";
+  }
+}
+
+sub kill_task {
+  my ($id) = @_;
+
+  check_task_exists($id);
+  print "About to kill task `" . summary($id) . "' (id $id).\n";
+  print "Are you sure? ";
+  my $reply = <STDIN>;
+  if ($reply =~ /y/i) {
+    my @old_cats = all_categories();
+    my $doomed = $tasks{$id};
+    print "Deleted task `" . summary($id) . "' (id $id)\n";
+    delete $tasks{$id};
+    my @new_cats = all_categories();
+    show_category_changes(\@old_cats, \@new_cats);
+  }
+}
+
+sub import_from_text_files {
+  opendir(DIR, $ttmdir) or die "Couldn't open $ttmdir: $!\n";
+  my @task_ids = grep /^\d+$/, readdir(DIR);
+  closedir(DIR);
+  undef %tasks;
+  foreach my $id (@task_ids) {
+    read_in_task_from_text_file($id);
+  }
+}
+
+sub export_to_text_files {
+  foreach my $id (keys %tasks) {
+    write_task_to_text_file($id);
+  }
+}
+
+
+#----------------------------------------------------------------------------#
+# auxiliary routines
+#----------------------------------------------------------------------------#
+
+sub core_headers {
+  return (qw/summary priority categories status/, 'date due');
+}
+
+sub is_user_header {
+  my ($header) = @_;
+
+  my $re = join '|', core_headers();
+
+  return ($header =~ /^(body|$re)$/i) ? 0 : 1;
+}
+
+sub is_in_categories {
+  my ($id, @categories) = @_;
+
+  my @categories_task_in = split /,\s*/, categories($id);
+  my %categories_task_in = map { lc($_) => 1 } @categories_task_in;
+
+  # Return true if task is in /any/ of the provided categories
+  foreach my $category (@categories) {
+    return $category if exists $categories_task_in{lc $category};
+  }
+
+  return 0;
+}
+
+sub show_category_changes {
+  my ($old, $new) = @_;
+
+  my %categories = map { $_ => 'old' } @$old;
+  foreach my $cat (@$new) {
+    $categories{$cat} .= 'new';
+  }
+
+  my @cats_added = ();
+  my @cats_deleted = ();
+  foreach my $cat (keys %categories) {
+    my $in = $categories{$cat};
+    push @cats_added,   $cat if $in eq 'new';
+    push @cats_deleted, $cat if $in eq 'old';
+  }
+  print "Added ", scalar(@cats_added), " new ",
+        (@cats_added == 1 ? 'category' : 'categories'),
+        ": ",
+        join (', ', @cats_added), "\n"
+    if @cats_added;
+  print "Deleted ", scalar(@cats_deleted), " new ",
+        (@cats_deleted == 1 ? 'category' : 'categories'),
+        ": ",
+        join (', ', @cats_deleted), "\n"
+    if @cats_deleted;
+}
+
+sub priority {
+  my ($id, $type) = @_;
+  $type ||= 'short';
+
+  my $priority = (defined $tasks{$id}{priority}) ? $tasks{$id}{priority} : '';
+
+  return $priority if $type eq 'numeric';
+
+  return '??'
+    unless $priority =~ /^\d+$/
+       and defined $priorities[$priority];
+
+  return $priorities[$priority][$type eq 'short' ? 0 : 1];
+}
+            
+sub dpriority {
+  my ($id) = @_;
+  my $prio = (defined $tasks{$id}{priority}) ? $tasks{$id}{priority} : '';
+  return ($prio =~ /^\d+$/) ? $prio : $default_priority;
+}
+
+sub summary {
+  my ($id) = @_;
+  return $tasks{$id}{summary} || '<no summary>';
+}
+
+sub status {
+  my ($id) = @_;
+  return $tasks{$id}{status} || 'NEW';
+}
+
+sub categories {
+  my ($id) = @_;
+  return $tasks{$id}{categories} || '';
+}
+
+sub date_due {
+  my ($id) = @_;
+  return $tasks{$id}{'date due'} || '';
+}
+
+sub all_categories {
+  my %categories = ();
+  foreach my $id (keys %tasks) {
+    $categories{$_}++ foreach split m/,\s*/x, categories($id);
+  }
+  
+  return sort keys %categories;
+}
+
+sub list_categories {
+  print map { "$_\n" } all_categories();
+}
+
+sub list_priorities {
+  for (0 .. $#priorities) {
+    printf "%3d: %-14s (%s)\n", $_, @{$priorities[$_]}[0, 1];
+  }
+}
+
+sub by_priority {
+  return dpriority($a) <=> dpriority($b)
+                       ||
+                    $a <=> $b;
+}
+
+sub check_task_exists {
+  my ($id) = @_;
+  die "Task $id doesn't exist\n" unless exists $tasks{$id};
+}
