@@ -6,47 +6,64 @@
 # reserved. This program is free software; you can redistribute it and/or
 # modify it under the same terms as Perl itself.
 #
-# $Id: ttm,v 1.32 2003/01/04 23:42:57 adams Exp $
+# Minor additions and enchancements by Jesse Becker <hawson@gmail.com> 2006-2009
 #
+
+# TODO List
+# - parse 'date due' and increase priority if appropriate
+#   (priorities will need time lengths assigned to them)#   - creation date (hence age)
+#   - add merge feature
+#   - add blocking
+#   - add option for moving completed jobs to a different hash
+#   - fractional priorities
+
 
 require 5.004;
 use strict;
 
-my $VERSION = '0.64';
+my $VERSION = '0.64-4';
 
 use Getopt::Std;
 use Text::Abbrev;
 use Fcntl qw{:DEFAULT :flock};
 use MLDBM qw{GDBM_File Storable};
+use Time::Local;
+use Date::Manip;
+use Data::Dumper;
 
 # Where shall we store the task database?
 my $ttmdir   = "$ENV{HOME}/.ttm";
 # What shall we call the GDBM file in this directory?
 my $dbm_file = "tasks.gdbm";
 
+my $logfile="$ttmdir/ttm.log";
+
 my @priorities = (
-                  [ 'emergency'  , 'do it NOW!'                        ],
-                  [ 'critical'   , 'action needed TODAY'               ],
-                  [ 'urgent'     , 'action needed today or tomorrow'   ],
-                  [ 'important'  , 'action needed within a few days'   ],
-                  [ 'sooner'     , 'action needed within a week'       ],
-                  [ 'later'      , 'action needed within a few weeks'  ],
-                  [ 'sometime'   , 'action needed within a few months' ],
-                  [ 'eventually' , 'whenever, dude'                    ],
-                  [ 'CFT'        , 'dogwash priority'                  ],
+                    # priority   ,  text  ,                          Age in days
+                  [ 'emergency'  , 'do it NOW!',                         0 ],
+                  [ 'critical'   , 'action needed TODAY',                1 ],
+                  [ 'urgent'     , 'action needed today or tomorrow',    4 ],
+                  [ 'important'  , 'action needed within a few days',   10 ],
+                  [ 'sooner'     , 'action needed within a week',       17 ],
+                  [ 'later'      , 'action needed within a few weeks',  28 ],
+                  [ 'sometime'   , 'action needed within a few months', 65 ],
+                  [ 'eventually' , 'whenever, dude',                    90 ],
+                  [ 'CFT'        , 'dogwash priority',                 180 ],
                  );
 
 # What priority do tasks get sorted with if no priority specified?
 my $default_priority = 4;
 
 # Default lowest priority (threshold) shown
-my $default_threshold = 3;
+my $default_threshold = 5;
 
 # Maximum task id
 my $max_task_id = 999;
 
 # Which editor shall we use?
-my $editor  = $ENV{VISUAL} || $ENV{EDITOR} || 'emacs -nw';
+my $editor  = $ENV{VISUAL} || $ENV{EDITOR} || 'vim';
+#my $editor_options = '-c i';
+#$editor .= " $editor_options";
 
 # Calculate terminal width.
 my $columns = $ENV{COLUMNS} || 80;
@@ -55,6 +72,21 @@ my $columns = $ENV{COLUMNS} || 80;
 # You shouldn't have to hack around with anything below here, unless you
 # really want to (in which case, let me know what you do).
 #----------------------------------------------------------------------------#
+
+BEGIN {
+sub debug {
+    my $message=shift;
+    my $state=shift;
+
+    $state=$ENV{DEBUG} if !defined($state);
+
+    return if !$state;
+
+    chomp $message;
+    print STDERR "$message\n"
+}
+}
+
 
 my %opts = ();
 my %tasks = ();
@@ -76,6 +108,7 @@ read_in_tasks();
 my %actions = ();
 abbrev \%actions, qw/list grep
                      add new
+                     change
                      edit
                      modify
                      resolve complete finish
@@ -92,6 +125,7 @@ foreach (keys %actions) {
   $actions{$_} =~ s/remove|delete/kill/i;
   $actions{$_} =~ s/new/add/i;
   $actions{$_} =~ s/finish|complete/resolve/i;
+  $actions{$_} =~ s/change/alter/i;
 }  
 
 my $action;
@@ -130,8 +164,8 @@ if ($action eq 'list') {
   }
 }
 elsif ($action eq 'add') {
-  usage() if @ARGV;
-  add_task();
+#  usage() if @ARGV;
+  add_task(@ARGV);
 }
 elsif ($action eq 'edit') {
   usage() unless @ARGV == 1;
@@ -161,6 +195,9 @@ elsif ($action eq 'import') {
 elsif ($action eq 'export') {
   export_to_text_files();
 }
+elsif ($action eq 'alter') {
+    print "Stub for altering fields on the command line.\n";
+}
 else {
   bug();
 }
@@ -178,13 +215,15 @@ exit 0;
 sub usage {
   print <<USAGE;
 ttm $VERSION, (c) 1999 Adam Spiers <adam\@spiers.net>
+    updates 2006-2009 by Jesse Becker <hawson\@gmail.com>
 
 Usage: ttm [ -d <dir> ] <action> <params>
 Actions (except import and export) may be abbreviated unambiguously, and are:
-   list [-a|-A] [-v] [-s <status regexp>] [-t <threshold>] [<categories>]
+   list [-a|-A] [-v] [-d <days>] [-s <status regexp>] [-t <threshold>] [<categories>]
                   -- list unblocked, unresolved, neglected tasks (by category)
                       `-A' shows all tasks regardless of status/priority
                       `-a' shows all unresolved tasks regardless of priority
+                      `-d' limits results to the previous X days.
                       `-s' shows tasks matching the specified status regexp
                       `-t' specifies a priority threshold (default 5)
                       `-v' inverts the sense of category matching
@@ -229,6 +268,7 @@ sub read_in_tasks {
 sub read_in_task_from_text_file {
   my ($id) = @_;
 
+  debug("Opening [$ttmdir/$id]");
   open(TASK, "$ttmdir/$id") or die "Couldn't open $ttmdir/$id: $!\n";
 
   my %task = ();
@@ -237,9 +277,26 @@ sub read_in_task_from_text_file {
   while (<TASK>) {
     chomp;
 
-    if (/^(\w+?): (.*)$/) {
-      die "`body' not allowed as header\n" if $1 eq 'body';
-      $task{$1} = $2;
+    # Header/text munging...
+    my ($header, $text);
+    if ( ($header, $text) = /^([\w ]+?):\s*(.*)$/ ) {
+      $header =~ s/^\s*(.+)\s*$/$1/;
+      $text   =~ s/^\s*//;
+      $text   =~ s/\s*$//;
+      debug("Header=[$header], Text=[$text]");
+
+      die "`body' not allowed as header\n" if $header eq 'body';
+
+      # Special handling for various fields
+      $text = ucfirst($text) if $header eq "categories";
+      if ($header =~ /(date due|creation date)/) {
+        # Convert to sec. since epoch if not already in that form
+        if ($text  !~ /^\d+$/) {
+            $text=UnixDate($text,"%s");
+        }
+      }
+
+      $task{$header} = $text;
       next;
     }
 
@@ -253,6 +310,12 @@ sub read_in_task_from_text_file {
   }
 
   close(TASK);
+  
+  # Check for missing, chanaged fields
+  if (!exists $task{dependency}) {
+    $task{dependency} = ();
+  }
+  
 
   $tasks{$id} = \%task;
 }
@@ -270,8 +333,16 @@ sub write_task_to_text_file {
   foreach my $header (core_headers(),
                       grep { is_user_header($_) } keys %task)
   {
-    my $value = $task{$header} || '';
-    printf TASK $format, $header, $value;
+        my $value = $task{$header} || '';
+        if ($header =~ /(date due|creation date|completion date)/) {
+            # Convert to sec. since epoch if not already in that form
+            if ($value  =~ /^\d+$/) {
+                #my $date=ParseDate($text);
+                $value=scalar localtime($value);
+            }
+        }
+
+        printf TASK $format, $header, $value;
   }
 
   print TASK '-' x ($columns - 1), "\n";
@@ -283,7 +354,7 @@ sub write_task_to_text_file {
 }  
 
 sub next_free_id {
-  my $next;
+  my $next=0;
   foreach my $id (keys %tasks) {
     $next = $id if $next < $id;
   }
@@ -352,14 +423,14 @@ sub display_task {
 
   check_task_exists($id);
 
-  my $format = "%12s: %s\n";
+  my $format = "%13s: %s\n";
 
   printf $format, 'summary', summary($id);
   printf $format, 'priority',
                   priority($id) . " (" . priority($id, 'long') . ")";
 
   printf $format, 'categories', categories($id);
-  printf $format, 'date due',   date_due($id);
+#  printf $format, 'date due',   date_due($id);
   printf $format, 'status',     status($id);
 
   my %task = %{$tasks{$id}};
@@ -379,19 +450,18 @@ sub display_task_list {
   my ($opts, @categories) = @_;
 
   my %grep = ();
-  if ($opts->{g}) {
-    my $re = ($opts->{g} =~ /[A-Z]/) ? qr/$opts->{g}/ : qr/$opts->{g}/i;
-
-   TASK:
-    foreach my $id (keys %tasks) {
-      my %task = %{$tasks{$id}};
-      foreach my $key (keys %task) {
-        if ($task{$key} =~ /$re/) {
-          $grep{$id}++;
-          next TASK;
-        }
-      }
-    }
+   if ($opts->{g}) {
+     my $re = ($opts->{g} =~ /[A-Z]/) ? qr/$opts->{g}/ : qr/$opts->{g}/i;
+     TASK:
+       foreach my $id (keys %tasks) {
+         my %task = %{$tasks{$id}};
+         foreach my $key (keys %task) {
+           if (exists $task{$key} && defined($task{$key}) && $task{$key} =~ /$re/) {
+             $grep{$id}++;
+             next TASK;
+           }
+         }
+       }
   }
 
   my ($exclude_status_re, $include_status_re);
@@ -411,12 +481,13 @@ sub display_task_list {
 
   $opts->{t} ||= $default_threshold;
 
-  my $hformat = "%3s %10.10s  %-9.9s %-53s\n";
-  my  $format = "%3d %10.10s  %-9.9s %-53s\n";
+  my $summary_width=$columns - (3+1+10+4+2+9+1+8+1);
+  my $hformat = "%3s %10.10s.%-3d  %-9.9s %-8.8s %-.$summary_width"."s\n";
+  my  $format = "%3d %10.10s.%-3d  %-9.9s %-8.8s %-.$summary_width"."s\n";
 
   my $out = '';
 
-  $out .= sprintf $hformat, qw/id priority status summary/;
+  $out .= sprintf $hformat, qw/id priority 0 status catgy summary/;
   $out .= sprintf '-' x ($columns - 1) . "\n";
 
   my $matches = 0;
@@ -438,7 +509,24 @@ sub display_task_list {
       next unless exists $grep{$id};
     }
 
-    $out .= sprintf $format, $id, priority($id), status($id), summary($id);
+    my $status = lc(status($id));
+    if ($status ne 'pending' and $status ne 'resolved' and overdue($id)) {
+        $status='OVERDUE';
+    }
+    
+    my @deps = dependencies($id);
+    foreach my $dep (@deps) {
+        if (!exists $tasks{$dep}){
+          warn "Job $id had non-existant dependency: $dep";
+        }
+        my $dep_status = $tasks{$dep}{status};
+        if ( $dep_status !~ qr/(done|resolved?|completed?|finish(ed)?)/i ) {
+          $status = "Blck:$dep";
+          last;
+        }
+    }        
+        
+    $out .= sprintf $format, $id, priority($id), days_old($id), ucfirst($status), categories($id), summary($id);
     $matches++;
   }
 
@@ -451,17 +539,29 @@ sub display_task_list {
 }
 
 sub add_task {
+  my @inputs=@_;
   my $id = next_free_id();
 
   my @old_cats = all_categories();
 
+  # Defaults
+  my $time=scalar localtime;
+  my $due=scalar (localtime (timelocal(localtime) + 86400*2));
+  #print STDERR $time,"\n";
+
+
+  #Default settings for new task
   my %task = (
-              summary    => '',
-              priority   => '',
-              categories => '',
-              body       => '',
-             );
+    summary        => $#_ ? join(' ', @_) :  '',
+    priority       => '4',
+    categories     => '',
+    body           => '',
+    dependency     => '',
+   'creation date' => $time,
+   'due date'      => $due
+    );
   $tasks{$id} = \%task;
+  
   write_task_to_text_file($id);
   
   system "$editor $ttmdir/$id";
@@ -495,6 +595,7 @@ sub resolve_task {
   check_task_exists($id);
   my %task = %{$tasks{$id}};
   $task{status} = 'resolved';
+  $task{'complete date'} = scalar localtime;
   $tasks{$id} = \%task;
   print "Resolved task `" . summary($id) . "' (id $id).\nGood going!\n";
 }
@@ -560,7 +661,7 @@ sub export_to_text_files {
 #----------------------------------------------------------------------------#
 
 sub core_headers {
-  return (qw/summary priority categories status/, 'date due');
+  return (qw/summary priority categories status/, 'date due', 'creation date');
 }
 
 sub is_user_header {
@@ -610,6 +711,22 @@ sub show_category_changes {
         ": ",
         join (', ', @cats_deleted), "\n"
     if @cats_deleted;
+}
+
+sub days_old {
+    my ($id) = @_;
+    my $create_time = $tasks{$id}{'creation date'};
+    my $now = timelocal(localtime());
+    my $days = ($now - $create_time)/86400;
+    #debug("ctime=$create_time now=$now",1);
+    return $days;
+}
+
+sub overdue {
+    my ($id) = @_;
+    my $age = days_old($id);
+    my $timelimit = $priorities[$tasks{$id}{priority}][2];
+    return ($age > $timelimit) ? 1 : 0;
 }
 
 sub priority {
@@ -681,4 +798,14 @@ sub by_priority {
 sub check_task_exists {
   my ($id) = @_;
   die "Task $id doesn't exist\n" unless exists $tasks{$id};
+}
+
+sub dependencies {
+    my ($id)=@_;
+    debug("checking deps on [$id]");
+    return unless exists $tasks{$id}{dependency};
+    my $deps = $tasks{$id}{dependency};
+    return if (!defined $deps or $deps =~ /^\s*$/);
+    my @deps =  split ( /(\s*,\s*|\s+)/, $deps);
+    return grep (/^\d+$/, @deps);
 }
