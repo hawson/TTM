@@ -9,13 +9,6 @@
 # Minor additions and enchancements by Jesse Becker <hawson@gmail.com> 2006-2009
 #
 
-# TODO List
-# - parse 'date due' and increase priority if appropriate
-#   (priorities will need time lengths assigned to them)#   - creation date (hence age)
-#   - add merge feature
-#   - add blocking
-#   - add option for moving completed jobs to a different hash
-
 
 require 5.004;
 use strict;

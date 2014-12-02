@@ -1,0 +1,9 @@
+TODO List
+ - parse 'date due' and increase priority if appropriate
+   (priorities will need time lengths assigned to them)#   - creation date (hence age)
+   - add merge feature
+   - add option for moving completed jobs to a different hash
+
+Done
+   - add blocking
+
