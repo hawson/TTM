@@ -15,7 +15,6 @@
 #   - add merge feature
 #   - add blocking
 #   - add option for moving completed jobs to a different hash
-#   - fractional priorities
 
 
 require 5.004;
@@ -30,26 +29,31 @@ use MLDBM qw{GDBM_File Storable};
 use Time::Local;
 use Date::Manip;
 use Data::Dumper;
+use Sys::Hostname;
+use File::Basename;
+
+my $hostname = hostname;
+$hostname =~ s/\..*//;
 
 # Where shall we store the task database?
 my $ttmdir   = "$ENV{HOME}/.ttm";
 # What shall we call the GDBM file in this directory?
-my $dbm_file = "tasks.gdbm";
+my $dbm_file = "tasks_$hostname.gdbm";
 
 my $logfile="$ttmdir/ttm.log";
 
 my @priorities = (
-                    # priority   ,  text  ,                          Age in days
-                  [ 'emergency'  , 'do it NOW!',                         0 ],
-                  [ 'critical'   , 'action needed TODAY',                1 ],
-                  [ 'urgent'     , 'action needed today or tomorrow',    4 ],
-                  [ 'important'  , 'action needed within a few days',   10 ],
-                  [ 'sooner'     , 'action needed within a week',       17 ],
-                  [ 'later'      , 'action needed within a few weeks',  28 ],
-                  [ 'sometime'   , 'action needed within a few months', 65 ],
-                  [ 'eventually' , 'whenever, dude',                    90 ],
-                  [ 'CFT'        , 'dogwash priority',                 180 ],
-                 );
+     # priority   ,  text  ,                          Age in days
+    [ 'emergency'  , 'do it NOW!',                         0 ],
+    [ 'critical'   , 'action needed TODAY',                1 ],
+    [ 'urgent'     , 'action needed today or tomorrow',    4 ],
+    [ 'important'  , 'action needed within a few days',   10 ],
+    [ 'sooner'     , 'action needed within a week',       17 ],
+    [ 'later'      , 'action needed within a few weeks',  28 ],
+    [ 'sometime'   , 'action needed within a few months', 65 ],
+    [ 'eventually' , 'whenever, dude',                    90 ],
+    [ 'CFT'        , 'dogwash priority',                 180 ],
+);
 
 # What priority do tasks get sorted with if no priority specified?
 my $default_priority = 4;
@@ -91,19 +95,21 @@ sub debug {
 my %opts = ();
 my %tasks = ();
 
-if (@ARGV and $ARGV[0] =~ /^-[^dh]/) {
+if (@ARGV and $ARGV[0] =~ /^-[^dfh]/) {
   unshift @ARGV, 'list';
 }
 
-getopts('d:h', \%opts);
+getopts('d:f:h', \%opts);
 
 if ($opts{h}) {
   usage();
+  exit 1;
 }
 
-$opts{d} and $ttmdir = $opts{d};
-check_tmdir();
-read_in_tasks();
+my $full_path = $opts{f} || "$ttmdir/$dbm_file";
+
+check_ttmdir($full_path);
+read_in_tasks($full_path);
 
 my %actions = ();
 abbrev \%actions, qw/list grep
@@ -215,11 +221,11 @@ exit 0;
 sub usage {
   print <<USAGE;
 ttm $VERSION, (c) 1999 Adam Spiers <adam\@spiers.net>
-    updates 2006-2009 by Jesse Becker <hawson\@gmail.com>
+    updates 2006-2009,2014 by Jesse Becker <hawson\@gmail.com>
 
 Usage: ttm [ -d <dir> ] <action> <params>
 Actions (except import and export) may be abbreviated unambiguously, and are:
-   list [-a|-A] [-v] [-d <days>] [-s <status regexp>] [-t <threshold>] [<categories>]
+   list [-f <file>] [-a|-A] [-v] [-d <days>] [-s <status regexp>] [-t <threshold>] [<categories>]
                   -- list unblocked, unresolved, neglected tasks (by category)
                       `-A' shows all tasks regardless of status/priority
                       `-a' shows all unresolved tasks regardless of priority
@@ -238,6 +244,7 @@ Actions (except import and export) may be abbreviated unambiguously, and are:
    priorities     -- list all priorities
    import/export  -- import/export from/to text files to/from GDBM
 `list' may be omitted altogether, unless `-d' is being used.
+The -f option indicates a file other than $ttmdir/$dbm_file
 USAGE
 
   exit 0;
@@ -247,11 +254,10 @@ sub bug {
   die <<'EOF';
 Congratulations, you have found a bug in ttm.  
 
-/Please/ e-mail Adam Spiers <adam@spiers.net> explaining exactly how
-you achieved this, so that he can fix it.
+/Please/ e-mail <hawson@gmail.com> explaining exactly how you achieved
+this, so that he can fix it.
 EOF
 
-  exit 1;
 }
 
 #----------------------------------------------------------------------------#
@@ -259,10 +265,12 @@ EOF
 #----------------------------------------------------------------------------#
 
 sub read_in_tasks {
+  my ($full_path) = @_;
+  debug("Reading in tasks from [$full_path]");
   set_lock();
 
-  tie %tasks, 'MLDBM', "$ttmdir/$dbm_file", O_CREAT | O_RDWR, 0640
-    or die "Couldn't open $ttmdir/$dbm_file: $!\n";
+  tie %tasks, 'MLDBM', "$full_path", O_CREAT | O_RDWR, 0640
+    or die "Couldn't open $full_path: $!\n";
 }
 
 sub read_in_task_from_text_file {
@@ -395,7 +403,10 @@ sub release_lock {
   close(LOCK);
 }
 
-sub check_tmdir {
+sub check_ttmdir {
+  my ($full_path) = @_;
+  my $ttmdir = dirname($full_path);
+  debug ("Checking on [$ttmdir] directory");
   return if -d $ttmdir;
 
   if (-e $ttmdir) {
@@ -450,18 +461,18 @@ sub display_task_list {
   my ($opts, @categories) = @_;
 
   my %grep = ();
-   if ($opts->{g}) {
-     my $re = ($opts->{g} =~ /[A-Z]/) ? qr/$opts->{g}/ : qr/$opts->{g}/i;
-     TASK:
-       foreach my $id (keys %tasks) {
-         my %task = %{$tasks{$id}};
-         foreach my $key (keys %task) {
-           if (exists $task{$key} && defined($task{$key}) && $task{$key} =~ /$re/) {
-             $grep{$id}++;
-             next TASK;
-           }
-         }
-       }
+  if ($opts->{g}) {
+    my $re = ($opts->{g} =~ /[A-Z]/) ? qr/$opts->{g}/ : qr/$opts->{g}/i;
+    TASK:
+      foreach my $id (keys %tasks) {
+        my %task = %{$tasks{$id}};
+        foreach my $key (keys %task) {
+          if (exists $task{$key} && defined($task{$key}) && $task{$key} =~ /$re/) {
+            $grep{$id}++;
+            next TASK;
+          }
+        }
+      }
   }
 
   my ($exclude_status_re, $include_status_re);
@@ -481,13 +492,13 @@ sub display_task_list {
 
   $opts->{t} ||= $default_threshold;
 
-  my $summary_width=$columns - (3+1+10+4+2+9+1+8+1);
-  my $hformat = "%3s %10.10s.%-3d  %-9.9s %-8.8s %-.$summary_width"."s\n";
-  my  $format = "%3d %10.10s.%-3d  %-9.9s %-8.8s %-.$summary_width"."s\n";
+  my $summary_width=$columns - (3+1+10+3+2+9+1+8+1+8+1);
+  my $hformat = "%3s %10.10s.%-3d %-9.9s %-8s %-8.8s %-.$summary_width"."s\n";
+  my  $format = "%3d %10.10s.%-3d %-9.9s %-8s %-8.8s %-.$summary_width"."s\n";
 
   my $out = '';
 
-  $out .= sprintf $hformat, qw/id priority 0 status catgy summary/;
+  $out .= sprintf $hformat, qw/id priority 0 status project catgy summary/;
   $out .= sprintf '-' x ($columns - 1) . "\n";
 
   my $matches = 0;
@@ -526,7 +537,7 @@ sub display_task_list {
         }
     }        
         
-    $out .= sprintf $format, $id, priority($id), days_old($id), ucfirst($status), categories($id), summary($id);
+    $out .= sprintf $format, $id, priority($id), days_old($id), ucfirst($status), projects($id), categories($id), summary($id);
     $matches++;
   }
 
@@ -555,10 +566,12 @@ sub add_task {
     summary        => $#_ ? join(' ', @_) :  '',
     priority       => '4',
     categories     => '',
+    projects       => '',
     body           => '',
     dependency     => '',
    'creation date' => $time,
-   'due date'      => $due
+   'due date'      => $due,
+    id             => $id,
     );
   $tasks{$id} = \%task;
   
@@ -661,7 +674,7 @@ sub export_to_text_files {
 #----------------------------------------------------------------------------#
 
 sub core_headers {
-  return (qw/summary priority categories status/, 'date due', 'creation date');
+  return (qw/summary priority categories projects status/, 'date due', 'creation date');
 }
 
 sub is_user_header {
@@ -715,10 +728,11 @@ sub show_category_changes {
 
 sub days_old {
     my ($id) = @_;
-    my $create_time = $tasks{$id}{'creation date'};
     my $now = timelocal(localtime());
+    my $create_time = $tasks{$id}{'creation date'} || $now ;
     my $days = ($now - $create_time)/86400;
-    #debug("ctime=$create_time now=$now",1);
+    $days = 999  if $days > 999;
+    debug("  days_old($id): ctime=$create_time now=$now");
     return $days;
 }
 
@@ -758,6 +772,11 @@ sub summary {
 sub status {
   my ($id) = @_;
   return $tasks{$id}{status} || 'NEW';
+}
+
+sub projects {
+  my ($id) = @_;
+  return $tasks{$id}{projects} || '';
 }
 
 sub categories {
